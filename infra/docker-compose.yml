@@ -1,0 +1,105 @@
+# Локальная инфраструктура: один брокер Kafka в режиме KRaft (без ZooKeeper) + Kafka UI.
+# Сервисы приложения запускаются на хосте (yarn dev), не в Docker — быстрее цикл правка→проверка.
+name: wfm-lite
+
+services:
+  kafka:
+    # 3.9.x — последняя ветка 3.x. На 4.x не идём: Kafka 4 удалила старые версии протокола (KIP-896),
+    # а KafkaJS не развивается с 2023 — меньше сюрпризов на локальном стенде.
+    image: apache/kafka:3.9.1
+    container_name: wfm-kafka
+    ports:
+      - '9092:9092' # для клиентов на хосте (наши сервисы, smoke)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # Три listener'а:
+      #   PLAINTEXT      — внутри docker-сети (kafka-ui, другие контейнеры) → kafka:19092
+      #   PLAINTEXT_HOST — с хоста (Mac)                                   → localhost:9092
+      #   CONTROLLER     — служебный, для KRaft-кворума
+      KAFKA_LISTENERS: PLAINTEXT://:19092,PLAINTEXT_HOST://:9092,CONTROLLER://:9093
+      # advertised — это адрес, который брокер СООБЩАЕТ клиенту в metadata. Клиент сначала идёт на
+      # bootstrap-адрес, получает advertised и дальше ходит уже по нему. Отсюда классический баг:
+      # "подключился и сразу упал" — когда advertised недоступен с той стороны, где живёт клиент.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # base64-UUID (22 символа); любой валидный, генерируется `kafka-storage.sh random-uuid`
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+      # Один брокер → фактор репликации 1. На проде: 3 брокера, RF=3, min.insync.replicas=2.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Топики создаём явно (create-topics.sh): опечатка в имени не должна молча создавать новый топик.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      # В dev не ждём 3 секунды перед первым ребалансом группы.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: '-Xms512m -Xmx512m'
+    volumes:
+      - ./kafka:/scripts:ro
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          '/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:19092 > /dev/null 2>&1',
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+    # Данные живут, пока жив контейнер: `yarn infra:down` = полный сброс. Для локального стенда это фича.
+
+  kafka-ui:
+    # Форк provectus/kafka-ui (оригинал не поддерживается). Топики, партиции, офсеты, lag групп.
+    image: ghcr.io/kafbat/kafka-ui:v1.4.2
+    container_name: wfm-kafka-ui
+    ports:
+      - '8080:8080'
+    environment:
+      KAFKA_CLUSTERS_0_NAME: wfm-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  postgres:
+    # Хранилище Forecast Service. 17 — свежая major; date_bin() для 15-минутных
+    # интервалов есть с 14. Без тома, как и Kafka: `yarn infra:down` = чистый лист.
+    image: postgres:17.6-alpine
+    container_name: wfm-postgres
+    ports:
+      - '5432:5432'
+    environment:
+      POSTGRES_USER: wfm
+      POSTGRES_PASSWORD: wfm # только локальный стенд
+      POSTGRES_DB: wfm
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U wfm -d wfm']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  prometheus:
+    # Метрики и алерты. 3.5 — LTS-ветка Prometheus 3.x. UI: http://localhost:9090
+    # (Alerts — состояние правил из alerts.yml). Без тома: история метрик живёт, пока жив контейнер.
+    image: prom/prometheus:v3.5.0
+    container_name: wfm-prometheus
+    ports:
+      - '9090:9090'
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+      # POST /-/reload — перечитать конфиг и правила без рестарта
+      - --web.enable-lifecycle
+    # Сервисы на хосте: на Docker Desktop host.docker.internal есть и так, на Linux — через host-gateway.
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:9090/-/ready > /dev/null']
+      interval: 5s
+      timeout: 3s
+      retries: 20

@@ -1,0 +1,47 @@
+{
+  "name": "wfm-lite",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Event-driven планирование нагрузки контакт-центра: Kafka на Node.js (NestJS + KafkaJS), React-дашборд",
+  "packageManager": "yarn@4.18.1",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "infra:up": "docker compose -f infra/docker-compose.yml up -d --wait && yarn infra:topics",
+    "infra:topics": "docker compose -f infra/docker-compose.yml exec -T kafka sh /scripts/create-topics.sh",
+    "infra:down": "docker compose -f infra/docker-compose.yml down",
+    "infra:logs": "docker compose -f infra/docker-compose.yml logs -f kafka",
+    "infra:alerts:test": "docker run --rm -v \"$PWD/infra/prometheus:/rules:ro\" -w /rules --entrypoint promtool prom/prometheus:v3.5.0 test rules alerts.test.yml",
+    "infra:prometheus:reload": "curl -fsS -X POST http://localhost:9090/-/reload && echo reloaded",
+    "build": "tsc -b tsconfig.build.json",
+    "build:ui": "yarn workspace @wfm/dashboard build",
+    "dev": "yarn build && concurrently -k -n tsc,sim,gw,fc,ui -c gray,blue,magenta,yellow,green \"tsc -b -w --preserveWatchOutput tsconfig.build.json\" \"yarn workspace @wfm/channel-simulator dev\" \"yarn workspace @wfm/realtime-gateway dev\" \"yarn workspace @wfm/forecast-service dev\" \"yarn workspace @wfm/dashboard dev\"",
+    "dev:sim": "yarn build && yarn workspace @wfm/channel-simulator dev",
+    "dev:gw": "yarn build && yarn workspace @wfm/realtime-gateway dev",
+    "dev:fc": "yarn build && yarn workspace @wfm/forecast-service dev",
+    "db:migrate": "yarn workspace @wfm/forecast-service migrate up",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "yarn build && tsc -p apps/dashboard/tsconfig.json --noEmit && tsc -p tsconfig.spec.json",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/node": "^24.0.0",
+    "concurrently": "^9.1.0",
+    "eslint": "^9.17.0",
+    "eslint-config-prettier": "^10.0.1",
+    "globals": "^15.14.0",
+    "prettier": "^3.4.2",
+    "typescript": "~5.8.3",
+    "typescript-eslint": "^8.18.2",
+    "vitest": "^3.2.0"
+  }
+}

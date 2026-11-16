@@ -1,0 +1,15 @@
+{
+  // Typecheck тестов. Сборочные tsconfig исключают *.spec.ts (тесты не попадают в dist), из-за чего
+  // смена сигнатуры не ломала компиляцию тестов (так summary() без аргумента однажды прошёл незамеченным).
+  // @wfm/contracts резолвится в собранный dist — поэтому запускается после `yarn build`.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "incremental": false
+  },
+  "include": ["packages/*/src/**/*.spec.ts", "apps/*/src/**/*.spec.ts"],
+  // dashboard — свой tsconfig (bundler-резолв, DOM), его тесты проверяет tsc -p apps/dashboard
+  "exclude": ["apps/dashboard"]
+}

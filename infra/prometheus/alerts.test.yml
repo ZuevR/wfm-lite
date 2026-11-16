@@ -1,0 +1,80 @@
+# Юнит-тесты алертов: promtool прогоняет синтетические ряды через правила и сверяет, какие алерты
+# горят в заданный момент. `yarn infra:alerts:test`.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 15s
+
+tests:
+  # Рост DLQ меряем по самому топику (high watermark от lag-монитора), два экземпляра gateway.
+  - interval: 15s
+    input_series:
+      - series: 'kafka_topic_partition_current_offset{topic="forecast-service.dlq", partition="0", instance="gw1"}'
+        values: '5 5 5 6 6 6'
+      - series: 'kafka_topic_partition_current_offset{topic="forecast-service.dlq", partition="0", instance="gw2"}'
+        values: '5 5 5 6 6 6'
+      - series: 'kafka_topic_partition_current_offset{topic="interaction.started", partition="0", instance="gw1"}'
+        values: '100 200 300 400 500 600' # обычный топик растёт — алерт не про него
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: WfmDeadLetters
+        exp_alerts: []
+      - eval_time: 75s
+        alertname: WfmDeadLetters
+        exp_alerts:
+          - exp_labels: { severity: warning, topic: forecast-service.dlq }
+            exp_annotations:
+              summary: 'В forecast-service.dlq появились сообщения за последние 5 мин — нужен разбор'
+
+  # Ради чего алерт меряет топик, а не счётчик процесса: forecast записал в DLQ и упал (kill -9)
+  # до следующего скрейпа — счётчик так и не показал 1, его ряд пропал. Топик рост помнит.
+  - interval: 15s
+    input_series:
+      - series: 'wfm_dlq_messages_total{app="forecast-service", reason="invalid"}'
+        values: '0 0 0 _ _ _'
+      - series: 'kafka_topic_partition_current_offset{topic="forecast-service.dlq", partition="2", instance="gw1"}'
+        values: '7 7 7 8 8 8'
+    alert_rule_test:
+      - eval_time: 75s
+        alertname: WfmDeadLetters
+        exp_alerts:
+          - exp_labels: { severity: warning, topic: forecast-service.dlq }
+            exp_annotations:
+              summary: 'В forecast-service.dlq появились сообщения за последние 5 мин — нужен разбор'
+
+  # Группа forecast-service опустела (консьюмер умер). Два экземпляра gateway меряют одно и то же.
+  - interval: 15s
+    input_series:
+      - series: 'kafka_consumergroup_members{group="forecast-service", state="Stable", app="realtime-gateway", instance="gw1"}'
+        values: '1 1 0 0 0 0 0 0 0'
+      - series: 'kafka_consumergroup_members{group="forecast-service", state="Stable", app="realtime-gateway", instance="gw2"}'
+        values: '1 1 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 45s
+        alertname: WfmConsumerGroupEmpty
+        exp_alerts: [] # пусто, но ещё не минуту (for: 1m)
+      - eval_time: 2m
+        alertname: WfmConsumerGroupEmpty
+        exp_alerts:
+          - exp_labels: { severity: critical, group: forecast-service }
+            exp_annotations:
+              summary: 'В группе forecast-service нет участников — события никто не обрабатывает'
+
+  # Консьюмер висит на повторах (БД лежит): gauge растёт вместе со временем блокировки.
+  - interval: 15s
+    input_series:
+      - series: 'wfm_consumer_blocked_seconds{app="forecast-service"}'
+        values: '0 0 15 30 45 60 75 0'
+    alert_rule_test:
+      - eval_time: 75s
+        alertname: WfmConsumerBlocked
+        exp_alerts: []
+      - eval_time: 90s
+        alertname: WfmConsumerBlocked
+        exp_alerts:
+          - exp_labels: { severity: warning, app: forecast-service }
+            exp_annotations:
+              summary: 'forecast-service больше минуты повторяет одно сообщение — партиция стоит'
+      - eval_time: 105s
+        alertname: WfmConsumerBlocked
+        exp_alerts: [] # восстановился — погас

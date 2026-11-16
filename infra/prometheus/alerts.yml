@@ -1,0 +1,91 @@
+# Алерты WFM-Lite. Alertmanager не поднимаем: состояние алертов — в UI Prometheus
+# (http://localhost:9090/alerts). Каждый алерт отвечает на вопрос «что сломалось у пользователя»,
+# а не «какая метрика странная». Проверка: `yarn infra:alerts:test` (promtool test rules).
+groups:
+  - name: wfm-availability
+    rules:
+      - alert: WfmServiceDown
+        expr: up{job="wfm"} == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: '{{ $labels.app }} не отвечает на /metrics'
+
+      - alert: WfmDatabaseDown
+        expr: wfm_db_up == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: 'forecast-service не видит PostgreSQL — консьюмер ждёт на повторах, lag растёт'
+
+  - name: wfm-consumers
+    rules:
+      # Снаружи: брокер говорит, что в наблюдаемой группе никого нет. Ловит консьюмер, который умер
+      # и сам ничего не сообщит, и упавший процесс целиком.
+      - alert: WfmConsumerGroupEmpty
+        expr: max by (group) (kafka_consumergroup_members{group="forecast-service"}) == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: 'В группе {{ $labels.group }} нет участников — события никто не обрабатывает'
+
+      # Изнутри: процесс жив, но консьюмер не в группе (вступает, ребалансится, упал).
+      - alert: WfmConsumerNotInGroup
+        expr: wfm_consumer_in_group == 0
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: '{{ $labels.app }}: консьюмер группы {{ $labels.group }} не в группе больше минуты'
+
+      # max by (group): lag меряет каждый экземпляр gateway — ряды дублируются.
+      - alert: WfmConsumerLagHigh
+        expr: max by (group) (kafka_consumergroup_lag_sum) > 1000
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: 'Группа {{ $labels.group }} отстаёт на {{ $value }} сообщений'
+
+      - alert: WfmLagMonitorDown
+        expr: wfm_lag_monitor_up == 0
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: 'Lag-монитор не достаёт до брокера — цифры lag устарели'
+
+      # Gauge сам равен длительности, `for` не нужен: > 60 — уже минуту висим на одном сообщении.
+      - alert: WfmConsumerBlocked
+        expr: wfm_consumer_blocked_seconds > 60
+        labels: { severity: warning }
+        annotations:
+          summary: '{{ $labels.app }} больше минуты повторяет одно сообщение — партиция стоит'
+
+      # Мерим по самому DLQ-топику (high watermark, снаружи), а не счётчиком wfm_dlq_messages_total:
+      # счётчик живёт в процессе forecast, и если тот упал до скрейпа, прирост теряется.
+      # Счётчик оставлен для разбивки по reason на графиках.
+      # max by (topic, partition): watermark меряет каждый экземпляр gateway.
+      - alert: WfmDeadLetters
+        expr: sum by (topic) (delta(max by (topic, partition) (kafka_topic_partition_current_offset{topic=~".+[.]dlq"})[5m:15s])) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: 'В {{ $labels.topic }} появились сообщения за последние 5 мин — нужен разбор'
+
+      - alert: WfmConsumerCrashLoop
+        expr: increase(wfm_consumer_crashes_total[10m]) > 3
+        labels: { severity: warning }
+        annotations:
+          summary: '{{ $labels.app }}: консьюмер падает снова и снова (restart={{ $labels.restart }})'
+
+  - name: wfm-producer
+    rules:
+      - alert: WfmPublishBufferFilling
+        expr: wfm_publish_buffer_size / wfm_publish_buffer_capacity > 0.8
+        for: 30s
+        labels: { severity: warning }
+        annotations:
+          summary: 'Буфер продюсера заполнен на {{ $value | humanizePercentage }} — скоро отказы'
+
+      - alert: WfmPublishRejecting
+        expr: increase(wfm_publish_rejected_total[1m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: 'Продюсер отвергает события (reason={{ $labels.reason }}) — они потеряны у источника'
